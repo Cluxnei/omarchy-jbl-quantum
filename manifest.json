@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "cluxnei.jbl-quantum",
+  "name": "JBL Quantum",
+  "version": "0.1.0",
+  "author": "Cluxnei",
+  "license": "MIT",
+  "description": "Battery, battery health history and usage stats for the JBL Quantum 360 wireless headset on its 2.4 GHz dongle.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "JBL Quantum",
+    "description": "Headset battery in the bar; popup with remaining time, 24h chart, battery health and usage.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showPercent": true,
+      "hideWhenAbsent": true,
+      "lowLevel": 20
+    },
+    "schema": [
+      {
+        "key": "showPercent",
+        "type": "boolean",
+        "label": "Show battery percent next to the icon",
+        "defaultValue": true
+      },
+      {
+        "key": "hideWhenAbsent",
+        "type": "boolean",
+        "label": "Hide when the dongle is unplugged",
+        "defaultValue": true
+      },
+      {
+        "key": "lowLevel",
+        "type": "integer",
+        "label": "Highlight battery at or below (%)",
+        "min": 5,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 20
+      }
+    ]
+  }
+}

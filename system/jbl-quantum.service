@@ -1,0 +1,12 @@
+[Unit]
+Description=JBL Quantum headset battery and usage logger
+After=graphical-session.target pipewire-pulse.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I %h/.config/omarchy/plugins/cluxnei.jbl-quantum/bin/jbl-quantumd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

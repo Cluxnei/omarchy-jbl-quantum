@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""JBL Quantum 360 dongle daemon.
+
+Reads the 2.4 GHz dongle's vendor HID interface, keeps a battery/usage history
+in SQLite and publishes a state.json the Omarchy bar widget watches.
+
+Protocol (reverse engineered; every value is a single byte). Input reports are
+pushed by the dongle on change; the matching feature report can be polled:
+
+    input  feature  meaning
+    0x08   0x49     battery percent
+    0x09   0x68     headset link (1 connected, 0 off / out of range)
+    0x06   0x67     boom mic attached
+    0x10   0x62     0..16, changes with the headset dial (volume?)
+    0x03   -        unknown, always 0 so far (logged as an event)
+           0x61     16 ascii bytes, chip + serial
+
+The dongle does not report charging; it is inferred from the battery rising.
+"""
+import fcntl, glob, json, os, select, sqlite3, subprocess, sys, time
+
+VID_PID = "00000ECB:00002115"
+HOME = os.path.expanduser("~")
+DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", HOME + "/.local/share"), "jbl-quantum")
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "jbl-quantum")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"), "jbl-quantum", "config.json")
+
+DEFAULTS = {
+    "ratedHours": 22,          # JBL's figure for the 2.4 GHz dongle
+    "notifyLevels": [20, 10],
+    "notifyFull": True,
+    "pauseMediaOnDisconnect": False,
+    "sampleSec": 60,
+}
+
+IN_MIC, IN_BATT, IN_LINK, IN_VOL = 0x06, 0x08, 0x09, 0x10
+F_BATT, F_LINK, F_MIC, F_VOL, F_SERIAL = 0x49, 0x68, 0x67, 0x62, 0x61
+FEATURE_SIZE = {F_BATT: 1, F_LINK: 1, F_MIC: 1, F_VOL: 1, F_SERIAL: 16}
+
+CHARGE_WINDOW = 45 * 60    # a rise newer than this still counts as charging
+POLL_SEC = 30
+STATS_SEC = 60
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log("config:", e)
+    return cfg
+
+
+def find_device():
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(node + "/device/uevent") as f:
+                if VID_PID in f.read().upper():
+                    return "/dev/" + os.path.basename(node)
+        except OSError:
+            pass
+    return None
+
+
+def get_feature(fd, rid):
+    size = FEATURE_SIZE[rid]
+    buf = bytearray([rid] + [0] * size)
+    fcntl.ioctl(fd, (3 << 30) | ((size + 1) << 16) | (ord("H") << 8) | 0x07, buf)
+    return bytes(buf[1:])
+
+
+def notify(summary, body="", urgency="normal"):
+    try:
+        subprocess.Popen(["notify-send", "-a", "JBL Quantum", "-u", urgency,
+                          "-i", "audio-headset", summary, body])
+    except OSError as e:
+        log("notify:", e)
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+
+
+class Store:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.db = sqlite3.connect(path)
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS samples (ts INTEGER NOT NULL, battery INTEGER NOT NULL,
+                                                mic INTEGER, volume INTEGER);
+            CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
+            CREATE TABLE IF NOT EXISTS events (ts INTEGER NOT NULL, kind TEXT NOT NULL, value INTEGER);
+            CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+            CREATE TABLE IF NOT EXISTS health (day TEXT PRIMARY KEY, full_hours REAL,
+                                               drop_pct INTEGER, hours REAL);
+        """)
+        self.db.commit()
+
+    def event(self, kind, value=None, ts=None):
+        self.db.execute("INSERT INTO events VALUES (?,?,?)", (int(ts or time.time()), kind, value))
+        self.db.commit()
+
+    def sample(self, battery, mic, volume):
+        self.db.execute("INSERT INTO samples VALUES (?,?,?,?)", (int(time.time()), battery, mic, volume))
+        self.db.commit()
+
+    def last_event(self, kind):
+        return self.db.execute("SELECT ts, value FROM events WHERE kind=? ORDER BY ts DESC LIMIT 1",
+                               (kind,)).fetchone()
+
+
+def discharge(rows, gap):
+    """Sum battery drop and connected hours over runs of non-increasing samples."""
+    drop, secs = 0, 0
+    prev = None
+    for ts, batt in rows:
+        if prev and ts - prev[0] <= gap and batt <= prev[1]:
+            drop += prev[1] - batt
+            secs += ts - prev[0]
+        prev = (ts, batt)
+    return drop, secs / 3600
+
+
+def compute_stats(store, cfg, now):
+    db = store.db
+    sample_sec = cfg["sampleSec"]
+    gap = sample_sec * 3
+    stats = {"ratedHours": cfg["ratedHours"]}
+
+    t = time.localtime(now)
+    midnight = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+    days = []
+    for i in range(6, -1, -1):
+        start = midnight - i * 86400
+        n = db.execute("SELECT COUNT(*) FROM samples WHERE ts>=? AND ts<?", (start, start + 86400)).fetchone()[0]
+        days.append({"start": int(start), "minutes": n * sample_sec // 60})
+    stats["days"] = days
+    stats["todayMin"] = days[-1]["minutes"]
+    stats["weekMin"] = sum(d["minutes"] for d in days)
+    total = db.execute("SELECT COUNT(*), MIN(ts) FROM samples").fetchone()
+    stats["totalHours"] = round(total[0] * sample_sec / 3600, 1)
+    stats["since"] = time.strftime("%Y-%m-%d", time.localtime(total[1])) if total[1] else None
+
+    # Equivalent full cycles: every percent lost counts, including while off.
+    batt_rows = db.execute("SELECT value FROM events WHERE kind='battery' ORDER BY ts").fetchall()
+    lost = sum(max(0, a[0] - b[0]) for a, b in zip(batt_rows, batt_rows[1:]))
+    stats["cycles"] = round(lost / 100, 2)
+    stats["charges"] = db.execute("SELECT COUNT(*) FROM events WHERE kind='charged'").fetchone()[0]
+
+    # Drain rate over the last 30 days of connected use; needs >=10% of drop to mean anything.
+    rows = db.execute("SELECT ts, battery FROM samples WHERE ts>=? ORDER BY ts", (now - 30 * 86400,)).fetchall()
+    drop, hours = discharge(rows, gap)
+    rate = drop / hours if hours > 0 and drop >= 10 else None
+    stats["ratePerHour"] = round(rate, 2) if rate else None
+    stats["fullHours"] = round(100 / rate, 1) if rate else None
+    stats["healthPct"] = round(100 / rate / cfg["ratedHours"] * 100) if rate else None
+    stats["sampleDrop"] = drop
+    stats["sampleHours"] = round(hours, 1)
+
+    # Recent rate (last 6h) for the time-remaining estimate; falls back to 30 days.
+    recent = [r for r in rows if r[0] >= now - 6 * 3600]
+    rdrop, rhours = discharge(recent, gap)
+    stats["recentRate"] = round(rdrop / rhours, 2) if rhours >= 0.5 and rdrop >= 5 else stats["ratePerHour"]
+
+    if rate:
+        db.execute("INSERT OR REPLACE INTO health VALUES (?,?,?,?)",
+                   (time.strftime("%Y-%m-%d", t), round(100 / rate, 2), drop, round(hours, 2)))
+        db.commit()
+    first = db.execute("SELECT full_hours FROM health ORDER BY day LIMIT 1").fetchone()
+    stats["baselineFullHours"] = first[0] if first else None
+    stats["healthHistory"] = [{"day": d, "fullHours": h} for d, h in
+                              db.execute("SELECT day, full_hours FROM health ORDER BY day DESC LIMIT 90")][::-1]
+
+    # Last 24h of battery for the sparkline, thinned to <=180 points.
+    spark = db.execute("SELECT ts, battery FROM samples WHERE ts>=? ORDER BY ts", (now - 86400,)).fetchall()
+    step = max(1, len(spark) // 180)
+    stats["spark"] = [list(p) for p in spark[::step]]
+    if spark and stats["spark"][-1] != list(spark[-1]):
+        stats["spark"].append(list(spark[-1]))
+    return stats
+
+
+class Daemon:
+    def __init__(self):
+        self.cfg = load_config()
+        self.store = Store(os.path.join(DATA_DIR, "history.db"))
+        self.state = {"dongle": False, "connected": False, "battery": None, "mic": None,
+                      "volume": None, "serial": None, "charging": False, "full": False,
+                      "sessionStart": None, "lastSeen": None, "defaultSink": False}
+        last = self.store.last_event("battery")
+        self.last_batt = last[1] if last else None
+        self.last_rise = None      # ts of the last battery increase
+        self.batt_at_disconnect = None
+        self.notified = set()
+        self.stats = {}
+        self.dirty = True
+
+    # --- state transitions -------------------------------------------------
+
+    def set_battery(self, value, now):
+        if not 0 <= value <= 100:
+            return
+        prev = self.last_batt
+        # Only a rise seen while linked is live charging; the dongle resends the
+        # battery just before the link on reconnect, so a jump then means it
+        # was charged while off (handled in set_link).
+        if prev is not None and value > prev and self.state["connected"]:
+            self.last_rise = now
+        if prev is None or value != prev:
+            self.store.event("battery", value, now)
+            self.last_batt = value
+        self.state["battery"] = value
+        self.check_alerts(prev, value)
+        self.dirty = True
+
+    def check_alerts(self, prev, value):
+        levels = sorted(self.cfg["notifyLevels"])
+        for lvl in levels:
+            if value > lvl + 5:
+                self.notified.discard(lvl)
+        for lvl in levels:
+            if value <= lvl and lvl not in self.notified and (prev is None or prev > value or prev > lvl):
+                self.notified.add(lvl)
+                self.store.event("low", value)
+                notify(f"Headset battery at {value}%", "JBL Quantum 360 needs charging soon",
+                       "critical" if lvl == levels[0] else "normal")
+                break
+        if self.cfg["notifyFull"] and value == 100 and prev is not None and prev < 100:
+            notify("Headset fully charged", "JBL Quantum 360 is at 100%")
+
+    def set_link(self, up, now):
+        if up == self.state["connected"]:
+            return
+        self.state["connected"] = up
+        self.store.event("connect" if up else "disconnect", None, now)
+        if up:
+            self.state["sessionStart"] = now
+            b0, b1 = self.batt_at_disconnect, self.state["battery"]
+            if b0 is not None and b1 is not None and b1 > b0:
+                self.store.event("charged", b1 - b0, now)
+            self.batt_at_disconnect = None
+        else:
+            self.state["sessionStart"] = None
+            self.batt_at_disconnect = self.last_batt
+            if self.cfg["pauseMediaOnDisconnect"]:
+                run(["playerctl", "-a", "pause"])
+        self.dirty = True
+
+    def handle_input(self, data, now):
+        if len(data) < 2:
+            return
+        rid, val = data[0], data[1]
+        if rid == IN_BATT:
+            self.set_battery(val, now)
+        elif rid == IN_LINK:
+            self.set_link(val == 1, now)
+        elif rid == IN_MIC:
+            if self.state["mic"] != bool(val):
+                self.store.event("mic", val, now)
+            self.state["mic"] = bool(val)
+        elif rid == IN_VOL:
+            self.state["volume"] = val
+        else:
+            self.store.event(f"in_{rid:02x}", val, now)
+        self.dirty = True
+
+    def poll(self, fd, now):
+        link = get_feature(fd, F_LINK)[0] == 1
+        if link:
+            # Battery before link, same order the dongle uses on reconnect.
+            self.set_battery(get_feature(fd, F_BATT)[0], now)
+        self.set_link(link, now)
+        if link:
+            self.state["mic"] = bool(get_feature(fd, F_MIC)[0])
+            self.state["volume"] = get_feature(fd, F_VOL)[0]
+            self.state["lastSeen"] = now
+        sink = run(["pactl", "get-default-sink"])
+        self.state["defaultSink"] = "JBL_Quantum" in sink
+
+    # --- output --------------------------------------------------------------
+
+    def write_state(self, now):
+        s = self.state
+        s["charging"] = bool(self.last_rise and now - self.last_rise < CHARGE_WINDOW
+                             and (s["battery"] or 0) < 100)
+        s["full"] = bool(self.last_rise and now - self.last_rise < CHARGE_WINDOW * 2
+                         and s["battery"] == 100)
+        rate = self.stats.get("recentRate")
+        s["remainingMin"] = (round(s["battery"] / rate * 60)
+                             if rate and s["connected"] and s["battery"] is not None and not s["charging"] else None)
+        out = dict(s, ts=now, stats=self.stats)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = os.path.join(STATE_DIR, ".state.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        os.replace(tmp, os.path.join(STATE_DIR, "state.json"))
+        self.dirty = False
+
+    # --- main loop -------------------------------------------------------------
+
+    def session(self, path):
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        log("opened", path)
+        try:
+            now = time.time()
+            self.state["dongle"] = True
+            self.state["serial"] = get_feature(fd, F_SERIAL).rstrip(b"\0").decode("ascii", "replace")
+            self.store.event("dongle_in", None, now)
+            self.poll(fd, now)
+            last_poll = last_sample = last_stats = 0
+            while True:
+                now = time.time()
+                if now - last_poll >= POLL_SEC:
+                    self.poll(fd, now)
+                    last_poll = now
+                if self.state["connected"] and now - last_sample >= self.cfg["sampleSec"] \
+                        and self.state["battery"] is not None:
+                    self.store.sample(self.state["battery"], int(bool(self.state["mic"])), self.state["volume"])
+                    last_sample = now
+                if now - last_stats >= STATS_SEC:
+                    self.stats = compute_stats(self.store, self.cfg, now)
+                    last_stats = now
+                    self.dirty = True
+                if self.dirty:
+                    self.write_state(now)
+                if select.select([fd], [], [], 1.0)[0]:
+                    while True:
+                        try:
+                            data = os.read(fd, 64)
+                        except BlockingIOError:
+                            break
+                        self.handle_input(data, time.time())
+        finally:
+            os.close(fd)
+
+    def run(self):
+        while True:
+            path = find_device()
+            if path:
+                try:
+                    self.session(path)
+                except OSError as e:
+                    log("device lost:", e)
+            if self.state["dongle"]:
+                now = time.time()
+                self.store.event("dongle_out", None, now)
+                self.set_link(False, now)
+                self.state["dongle"] = False
+                self.dirty = True
+            if self.dirty or not self.stats:
+                self.stats = compute_stats(self.store, self.cfg, time.time())
+                self.write_state(time.time())
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    try:
+        Daemon().run()
+    except KeyboardInterrupt:
+        pass

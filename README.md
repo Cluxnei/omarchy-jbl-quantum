@@ -28,15 +28,32 @@ All history stays local, in `~/.local/share/jbl-quantum/history.db` (SQLite).
 
 ## Install
 
+**1. Add the plugin and start its service**
+
 ```bash
 omarchy plugin add https://github.com/Cluxnei/omarchy-jbl-quantum.git --enable
 ~/.config/omarchy/plugins/cluxnei.jbl-quantum/install.sh
 ```
 
-`install.sh` does two things a shell plugin can't do on its own:
+`install.sh` never uses `sudo`. It installs and starts the user service `jbl-quantum.service`, a small Python daemon (standard library only) that listens to the dongle and keeps the history.
 
-1. **udev rule** (asks for `sudo` once): `/etc/udev/rules.d/70-jbl-quantum.rules` gives the logged-in user (`uaccess`) access to the dongle's HID node. Nothing else gets access.
-2. **User service** `jbl-quantum.service`: a small Python daemon (standard library only) that listens to the dongle and keeps the history.
+**2. Give your user access to the dongle (one-time, as root)**
+
+The daemon reads the dongle through `/dev/hidrawN`, which only root can read by default. Save this single line as `/etc/udev/rules.d/70-jbl-quantum.rules`:
+
+```
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0ecb", ATTRS{idProduct}=="2115", TAG+="uaccess"
+```
+
+For example:
+
+```bash
+echo 'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0ecb", ATTRS{idProduct}=="2115", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/70-jbl-quantum.rules
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+```
+
+`uaccess` grants access only to the user logged in at the seat, and only for this vendor/product ID. Nothing else changes. If `install.sh` finds the dongle already readable, it says so and you can skip this step.
 
 The widget shows up on the right side of the bar. Move it with `omarchy plugin enable cluxnei.jbl-quantum --section left|center|right`.
 
@@ -45,6 +62,7 @@ The widget shows up on the right side of the bar. Move it with `omarchy plugin e
 ```bash
 ~/.config/omarchy/plugins/cluxnei.jbl-quantum/install.sh --uninstall
 omarchy plugin remove cluxnei.jbl-quantum
+sudo rm /etc/udev/rules.d/70-jbl-quantum.rules
 rm -rf ~/.local/share/jbl-quantum   # only if you want to drop the history too
 ```
 
@@ -109,12 +127,12 @@ python3 tools/probe.py /dev/hidrawN        # dump every feature report
 python3 tools/watch.py /dev/hidrawN 120    # print changes while you power-cycle, plug the mic, etc.
 ```
 
-(Find the right `hidrawN` with `grep -l 0ECB /sys/class/hidraw/*/device/uevent`. You'll need the udev rule with your product ID first.) Please open an issue or PR with what you find.
+(Find the right `hidrawN` with `grep -l 0ECB /sys/class/hidraw/*/device/uevent`. You'll need the udev rule above with your product ID first.) Please open an issue or PR with what you find.
 
 ## Troubleshooting
 
 - **Popup says "Start the daemon"**: run `systemctl --user status jbl-quantum` and `journalctl --user -u jbl-quantum`.
-- **"Dongle not plugged in" while it is plugged in**: check that the udev rule applied with `getfacl /dev/hidraw*` (your user should be listed). Replugging the dongle also helps.
+- **"Dongle not plugged in" while it is plugged in**: check that the udev rule from step 2 applied with `getfacl /dev/hidraw*` (your user should be listed). Replugging the dongle also helps.
 - **Widget changes don't show up after editing `Model.js`**: QML caches JS libraries. Run `omarchy-restart-shell`.
 
 ## License
